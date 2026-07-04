@@ -562,12 +562,23 @@ class AzureBlobFileSystem(AsyncFileSystem):
 
         Returns True if the endpoint responds, indicating HNS is enabled.
         Uses asyncio.wait_for to avoid OS-level TCP connect timeouts.
+
+        We distinguish two classes of errors:
+        * HTTP-level errors (e.g. 403 AuthorizationPermissionMismatch, 401)
+          mean the DFS endpoint exists and responded — HNS is enabled.
+        * Connection-level errors (DNS, timeout, connection refused) mean
+          the endpoint is unreachable — HNS is not enabled.
         """
+        from azure.core.exceptions import HttpResponseError
+
         try:
             await asyncio.wait_for(
-                self.service_client.get_account_information(),
+                self.service_client.get_service_properties(),
                 timeout=timeout,
             )
+            return True
+        except HttpResponseError:
+            # HTTP response received → DFS endpoint is alive → HNS enabled
             return True
         except Exception:
             return False
@@ -648,16 +659,20 @@ class AzureBlobFileSystem(AsyncFileSystem):
                 return
             elif url_ep == "dfs":
                 dfs_url = f"https://{self.account_name}.dfs.core.{cloud_suffix}"
+                blob_url = (
+                    f"https://{self.account_name}.blob.core.{cloud_suffix}"
+                )
                 self._connect_to(dfs_url)
                 hns = sync(self.loop, self._probe_hns)
                 if hns:
                     self.account_url = dfs_url
+                    # Reconnect service_client to Blob endpoint —
+                    # Blob SDK operations (list_containers, etc.)
+                    # are not valid on the DFS endpoint.
+                    self._connect_to(blob_url)
                     self._hns_enabled = True
                     return
                 # DFS in URI but unreachable: fall back to Blob
-                blob_url = (
-                    f"https://{self.account_name}.blob.core.{cloud_suffix}"
-                )
                 self._connect_to(blob_url)
                 self.account_url = blob_url
                 self._hns_enabled = False
@@ -670,6 +685,10 @@ class AzureBlobFileSystem(AsyncFileSystem):
             hns = sync(self.loop, self._probe_hns)
             if hns:
                 self.account_url = dfs_url
+                # Reconnect service_client to Blob endpoint —
+                # Blob SDK operations (list_containers, etc.)
+                # are not valid on the DFS endpoint.
+                self._connect_to(blob_url)
                 self._hns_enabled = True
                 return
             # Fallback: reconnect to Blob endpoint
@@ -1916,6 +1935,12 @@ class AzureBlobFileSystem(AsyncFileSystem):
         """Copy the file at path1 to path2"""
         container1, blob1, version_id = self.split_path(path1, delimiter="/")
         container2, blob2, _ = self.split_path(path2, delimiter="/")
+
+        # When called via copy(recursive=True), fsspec may include directory
+        # paths in the expanded list.  Directories are implicitly created
+        # when their contained files are copied — skip them here.
+        if await self._isdir(path1):
+            return
 
         cc1 = self.service_client.get_container_client(container1)
         blobclient1 = cc1.get_blob_client(blob=blob1)

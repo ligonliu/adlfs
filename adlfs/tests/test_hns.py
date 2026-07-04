@@ -2,17 +2,22 @@
 Tests for Hierarchical Namespace (HNS) features.
 
 These tests require a real ADLS Gen2 storage account (Azurite does not
-support HNS).  Set the following environment variables before running:
+support HNS) and are fully self-contained — no dependency on conftest.py.
 
-    ADLFS_TEST_ACCOUNT_NAME      # myaccount
-    ADLFS_TEST_ACCOUNT_KEY       # shared key, or omit for DefaultAzureCredential
-    ADLFS_TEST_CONTAINER         # container name to use (created if needed)
+Environment variables:
+    ADLFS_TEST_ACCOUNT_NAME    Storage account name (required)
+    ADLFS_TEST_CONTAINER       Container name (default: adlfs-hns-test)
+    ADLFS_TEST_ACCOUNT_KEY     Shared key (optional; omit for managed identity)
+    ADLFS_TEST_ACCOUNT_HOST    Custom endpoint host (optional)
+    AZURE_CLIENT_ID            UAMI client ID (optional; for user-assigned MI)
 
-Alternatively, edit the defaults in ``_config()`` below.
+Authentication precedence:
+    account_key provided → shared-key auth
+    No account_key → DefaultAzureCredential (picks up managed identity,
+                       environment variables, AZ CLI login, etc.)
 
-Run isolated from the Azurite-based suite:
-
-    pytest tests/test_hns.py -v
+Run:
+    AZURE_CLIENT_ID=<id> ADLFS_TEST_ACCOUNT_NAME=myaccount pytest tests/test_hns.py -v
 """
 
 import os
@@ -23,35 +28,42 @@ from adlfs import AzureBlobFileSystem
 
 
 def _config():
-    """Return (account_name, account_key, container) from env or defaults."""
-    name = os.getenv("ADLFS_TEST_ACCOUNT_NAME", "")
-    key = os.getenv("ADLFS_TEST_ACCOUNT_KEY", "")
-    container = os.getenv("ADLFS_TEST_CONTAINER", "adlfs-hns-test")
-    return name, key, container
+    """Return (account_name, account_key, container, account_host) from env."""
+    name = os.environ["ADLFS_TEST_ACCOUNT_NAME"]
+    key = os.environ.get("ADLFS_TEST_ACCOUNT_KEY", "")
+    container = os.environ.get("ADLFS_TEST_CONTAINER", "adlfs-hns-test")
+    host = os.environ.get("ADLFS_TEST_ACCOUNT_HOST", "")
+    return name, key, container, host
 
 
 def _require_live_account():
-    """Skip if no ADLS Gen2 account is configured."""
-    name, _, _ = _config()
-    if not name:
+    """Skip if ADLS Gen2 account name is not set."""
+    if "ADLFS_TEST_ACCOUNT_NAME" not in os.environ:
         pytest.skip("Set ADLFS_TEST_ACCOUNT_NAME to run HNS integration tests")
+
+
+def _make_fs(account_name, account_key, account_host, **extra):
+    """Build AzureBlobFileSystem with the right auth for the test environment."""
+    kw = {}
+    if account_host:
+        kw["account_host"] = account_host
+    if account_key:
+        kw["account_key"] = account_key
+    kw.update(extra)
+    return AzureBlobFileSystem(account_name=account_name, **kw)
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def hns_fs():
-    """An AzureBlobFileSystem connected to a real ADLS Gen2 account.
-
-    Uses the auto-detection flow (DFS-first with Blob fallback).
-    """
+    """AzureBlobFileSystem connected via auto-detection (DFS-first with fallback)."""
     _require_live_account()
-    name, key, container = _config()
-    kw = {"account_key": key} if key else {}
-    fs = AzureBlobFileSystem(account_name=name, **kw)
-    if container not in [c["name"] for c in fs.ls("")]:
+    name, key, container, host = _config()
+    fs = _make_fs(name, key, host)
+    if container not in [c["name"] for c in fs.ls("", detail=True)]:
         fs.mkdir(container)
     yield fs
     fs.rm(container, recursive=True)
@@ -61,8 +73,10 @@ def hns_fs():
 def hns_fs_blob_uri():
     """Force Blob endpoint via a blob.core.windows.net URI."""
     _require_live_account()
-    name, key, _ = _config()
-    kw = {"account_key": key} if key else {}
+    name, key, _, host = _config()
+    kw = {}
+    if key:
+        kw["account_key"] = key
     uri = f"abfss://none@{name}.blob.core.windows.net/none"
     fs = AzureBlobFileSystem(uri, **kw)
     yield fs
@@ -72,8 +86,10 @@ def hns_fs_blob_uri():
 def hns_fs_account_host():
     """Force DFS endpoint via explicit account_host."""
     _require_live_account()
-    name, key, _ = _config()
-    kw = {"account_key": key} if key else {}
+    name, key, _, _ = _config()
+    kw = {}
+    if key:
+        kw["account_key"] = key
     fs = AzureBlobFileSystem(
         account_name=name,
         account_host=f"{name}.dfs.core.windows.net",
@@ -107,14 +123,13 @@ class TestEndpointSelection:
     def test_short_uri_defaults_to_dfs_first(self):
         """Short URI (abfs://container/path) with account_name= probes DFS."""
         _require_live_account()
-        name, key, _ = _config()
-        kw = {"account_key": key} if key else {}
-        fs = AzureBlobFileSystem(account_name=name, **kw)
+        name, key, _, host = _config()
+        fs = _make_fs(name, key, host)
         try:
             assert fs.hns_enabled is True
             assert fs.account_url.endswith(".dfs.core.windows.net")
         finally:
-            pass  # no containers created
+            pass  # no containers created, nothing to clean up
 
 
 # ---------------------------------------------------------------------------
@@ -125,22 +140,31 @@ class TestDirExists:
     """Verify optimized directory-existence checks on HNS."""
 
     def test_dir_exists_for_existing_directory(self, hns_fs):
-        name, _, container = _config()
+        name, _, container, _ = _config()
         dir_path = f"{container}/subdir"
         hns_fs.pipe(f"{dir_path}/afile.txt", b"hello")
         assert hns_fs.exists(dir_path)
         assert hns_fs.isdir(dir_path)
 
     def test_dir_exists_for_nonexistent_directory(self, hns_fs):
-        name, _, container = _config()
+        name, _, container, _ = _config()
         assert not hns_fs.exists(f"{container}/nonexistent")
 
-    def test_dir_exists_for_file_is_not_dir(self, hns_fs):
-        name, _, container = _config()
+    def test_file_is_not_dir(self, hns_fs):
+        name, _, container, _ = _config()
         path = f"{container}/plain_file.txt"
         hns_fs.pipe(path, b"hello")
         assert not hns_fs.isdir(path)
         assert hns_fs.isfile(path)
+
+    def test_nested_directory_hierarchy(self, hns_fs):
+        name, _, container, _ = _config()
+        deep = f"{container}/a/b/c"
+        hns_fs.pipe(f"{deep}/file.txt", b"nested")
+        assert hns_fs.isdir(f"{container}/a")
+        assert hns_fs.isdir(f"{container}/a/b")
+        assert hns_fs.isdir(deep)
+        assert hns_fs.isfile(f"{deep}/file.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +172,10 @@ class TestDirExists:
 # ---------------------------------------------------------------------------
 
 class TestRename:
-    """Verify _mv_file behavior."""
+    """Verify _mv_file behavior for both same-container and cross-container."""
 
     def test_rename_same_container(self, hns_fs):
-        """Same-container rename should succeed."""
-        name, _, container = _config()
+        name, _, container, _ = _config()
         src = f"{container}/source.txt"
         dst = f"{container}/target.txt"
         content = b"rename-me"
@@ -165,8 +188,7 @@ class TestRename:
         assert hns_fs.cat(dst) == content
 
     def test_rename_preserves_metadata(self, hns_fs):
-        """Rename should preserve file size and content."""
-        name, _, container = _config()
+        name, _, container, _ = _config()
         src = f"{container}/meta_src.txt"
         dst = f"{container}/meta_dst.txt"
         content = b"metadata-test"
@@ -180,8 +202,7 @@ class TestRename:
         assert hns_fs.cat(dst) == content
 
     def test_rename_cross_container(self, hns_fs):
-        """Cross-container rename falls back to copy+delete."""
-        name, _, container1 = _config()
+        name, _, container1, _ = _config()
         container2 = f"{container1}-cross"
         hns_fs.mkdir(container2)
 
@@ -200,13 +221,26 @@ class TestRename:
             hns_fs.rm(container2, recursive=True)
 
     def test_rename_same_path_noop(self, hns_fs):
-        """Moving a file to itself is a no-op."""
-        name, _, container = _config()
+        name, _, container, _ = _config()
         path = f"{container}/noop.txt"
         hns_fs.pipe(path, b"noop")
         hns_fs.mv(path, path)
         assert hns_fs.exists(path)
         assert hns_fs.cat(path) == b"noop"
+
+    def test_rename_directory(self, hns_fs):
+        name, _, container, _ = _config()
+        src_dir = f"{container}/srcdir"
+        dst_dir = f"{container}/dstdir"
+        hns_fs.pipe(f"{src_dir}/a.txt", b"a")
+        hns_fs.pipe(f"{src_dir}/b.txt", b"b")
+
+        hns_fs.mv(src_dir, dst_dir, recursive=True)
+
+        assert not hns_fs.exists(src_dir)
+        assert hns_fs.isdir(dst_dir)
+        assert hns_fs.cat(f"{dst_dir}/a.txt") == b"a"
+        assert hns_fs.cat(f"{dst_dir}/b.txt") == b"b"
 
 
 # ---------------------------------------------------------------------------
@@ -217,33 +251,57 @@ class TestIntegration:
     """End-to-end workflow on HNS."""
 
     def test_full_workflow(self, hns_fs):
-        """Create, list, read, rename, delete."""
-        name, _, container = _config()
+        """Create, list, read, rename, delete — end to end."""
+        name, _, container, _ = _config()
 
-        hns_fs.pipe(f"{container}/a.txt", b"aaa")
-        hns_fs.pipe(f"{container}/subdir/b.txt", b"bbb")
+        prefix = "wf"
+        hns_fs.pipe(f"{container}/{prefix}/a.txt", b"aaa")
+        hns_fs.pipe(f"{container}/{prefix}/subdir/b.txt", b"bbb")
 
-        listing = hns_fs.ls(container, detail=True)
+        listing = hns_fs.ls(f"{container}/{prefix}", detail=True)
         names = {e["name"] for e in listing}
-        assert f"{container}/a.txt" in names
-        assert f"{container}/subdir" in names
+        assert f"{container}/{prefix}/a.txt" in names
+        assert f"{container}/{prefix}/subdir" in names
 
-        sub = hns_fs.ls(f"{container}/subdir")
-        assert sub == [f"{container}/subdir/b.txt"]
+        sub = hns_fs.ls(f"{container}/{prefix}/subdir")
+        assert sub == [f"{container}/{prefix}/subdir/b.txt"]
 
-        hns_fs.mv(f"{container}/a.txt", f"{container}/renamed.txt")
-        assert not hns_fs.exists(f"{container}/a.txt")
-        assert hns_fs.cat(f"{container}/renamed.txt") == b"aaa"
+        hns_fs.mv(f"{container}/{prefix}/a.txt", f"{container}/{prefix}/renamed.txt")
+        assert not hns_fs.exists(f"{container}/{prefix}/a.txt")
+        assert hns_fs.cat(f"{container}/{prefix}/renamed.txt") == b"aaa"
 
-        hns_fs.rm(f"{container}/subdir", recursive=True)
-        assert not hns_fs.exists(f"{container}/subdir")
+        hns_fs.rm(f"{container}/{prefix}/subdir", recursive=True)
+        assert not hns_fs.exists(f"{container}/{prefix}/subdir")
 
     def test_find_recursive(self, hns_fs):
-        """find() traverses recursively under HNS."""
-        name, _, container = _config()
+        name, _, container, _ = _config()
         hns_fs.pipe(f"{container}/d1/f1.txt", b"1")
         hns_fs.pipe(f"{container}/d1/d2/f2.txt", b"2")
 
         found = hns_fs.find(container)
         assert f"{container}/d1/f1.txt" in found
         assert f"{container}/d1/d2/f2.txt" in found
+
+    def test_open_read_write(self, hns_fs):
+        name, _, container, _ = _config()
+        path = f"{container}/readwrite.txt"
+        data = b"hello-hns"
+
+        with hns_fs.open(path, "wb") as f:
+            f.write(data)
+
+        with hns_fs.open(path, "rb") as f:
+            assert f.read() == data
+
+    def test_cp_file_within_container(self, hns_fs):
+        name, _, container, _ = _config()
+        src = f"{container}/cp_src.txt"
+        dst = f"{container}/cp_dst.txt"
+        content = b"copy-me"
+
+        hns_fs.pipe(src, content)
+        hns_fs.cp(src, dst)
+
+        assert hns_fs.exists(src)
+        assert hns_fs.exists(dst)
+        assert hns_fs.cat(src) == hns_fs.cat(dst)
