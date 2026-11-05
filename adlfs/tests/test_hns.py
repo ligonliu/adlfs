@@ -57,6 +57,7 @@ def _make_fs(account_name, account_key, account_host, **extra):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def hns_fs():
     """AzureBlobFileSystem connected via auto-detection (DFS-first with fallback)."""
@@ -102,6 +103,7 @@ def hns_fs_account_host():
 # Phase 1 — Endpoint selection and HNS detection
 # ---------------------------------------------------------------------------
 
+
 class TestEndpointSelection:
     """Verify the do_connect() precedence chain."""
 
@@ -135,6 +137,7 @@ class TestEndpointSelection:
 # ---------------------------------------------------------------------------
 # Phase 2 — HNS-aware _dir_exists
 # ---------------------------------------------------------------------------
+
 
 class TestDirExists:
     """Verify optimized directory-existence checks on HNS."""
@@ -170,6 +173,7 @@ class TestDirExists:
 # ---------------------------------------------------------------------------
 # Phase 3 — DFS-native rename
 # ---------------------------------------------------------------------------
+
 
 class TestRename:
     """Verify _mv_file behavior for both same-container and cross-container."""
@@ -246,6 +250,7 @@ class TestRename:
 # ---------------------------------------------------------------------------
 # Integration
 # ---------------------------------------------------------------------------
+
 
 class TestIntegration:
     """End-to-end workflow on HNS."""

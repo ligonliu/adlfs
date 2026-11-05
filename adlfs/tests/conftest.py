@@ -40,25 +40,38 @@ def storage(host):
     bbs.insert_time = datetime.datetime.now(tz=datetime.timezone.utc).replace(
         microsecond=0
     )
-    container_client.upload_blob("top_file.txt", data)
-    container_client.upload_blob("root/rfile.txt", data)
-    container_client.upload_blob("root/a/file.txt", data)
-    container_client.upload_blob("root/a1/file1.txt", data)
-    container_client.upload_blob("root/b/file.txt", data)
-    container_client.upload_blob("root/c/file1.txt", data)
-    container_client.upload_blob("root/c/file2.txt", data)
+    container_client.upload_blob("top_file.txt", data, overwrite=True)
+    container_client.upload_blob("root/rfile.txt", data, overwrite=True)
+    container_client.upload_blob("root/a/file.txt", data, overwrite=True)
+    container_client.upload_blob("root/a1/file1.txt", data, overwrite=True)
+    container_client.upload_blob("root/b/file.txt", data, overwrite=True)
+    container_client.upload_blob("root/c/file1.txt", data, overwrite=True)
+    container_client.upload_blob("root/c/file2.txt", data, overwrite=True)
     container_client.upload_blob(
-        "root/d/file_with_metadata.txt", data, metadata=metadata
+        "root/d/file_with_metadata.txt", data, metadata=metadata, overwrite=True
     )
-    container_client.upload_blob("root/e+f/file1.txt", data)
-    container_client.upload_blob("root/e+f/file2.txt", data)
+    container_client.upload_blob("root/e+f/file1.txt", data, overwrite=True)
+    container_client.upload_blob("root/e+f/file2.txt", data, overwrite=True)
     yield bbs
 
-    bbs.delete_container("data")
+    try:
+        bbs.delete_container("data")
+    except Exception:
+        pass
 
 
 @pytest.fixture(scope="session", autouse=True)
-def spawn_azurite():
+def spawn_azurite(host):
+    import socket
+
+    h, p = host.split(":")
+    try:
+        with socket.create_connection((h, int(p)), timeout=1):
+            yield None
+            return
+    except Exception:
+        pass
+
     print("Starting azurite docker container")
     client = docker.from_env()
     azurite = client.containers.run(

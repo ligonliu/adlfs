@@ -571,29 +571,26 @@ class AzureBlobFileSystem(AsyncFileSystem):
         """Whether the storage account has hierarchical namespace enabled."""
         return getattr(self, "_hns_enabled", False)
 
-    async def _probe_hns(self, timeout: float = _DFS_PROBE_TIMEOUT) -> bool:
-        """Probe the DFS endpoint to verify it's reachable via the Blob SDK.
-
-        Returns True if the endpoint responds, indicating HNS is enabled.
-        Uses asyncio.wait_for to avoid OS-level TCP connect timeouts.
-
-        We distinguish two classes of errors:
-        * HTTP-level errors (e.g. 403 AuthorizationPermissionMismatch, 401)
-          mean the DFS endpoint exists and responded — HNS is enabled.
-        * Connection-level errors (DNS, timeout, connection refused) mean
-          the endpoint is unreachable — HNS is not enabled.
-        """
-        from azure.core.exceptions import HttpResponseError
+    async def _probe_hns(
+        self, dfs_url: Optional[str] = None, timeout: float = _DFS_PROBE_TIMEOUT
+    ) -> bool:
+        """Probe the DFS endpoint to verify it's reachable and HNS is enabled."""
+        if dfs_url is None:
+            suffix = getattr(self, "_cloud_suffix", "windows.net")
+            dfs_url = f"https://{self.account_name}.dfs.core.{suffix}"
+        import aiohttp
 
         try:
-            await asyncio.wait_for(
-                self.service_client.get_service_properties(),
-                timeout=timeout,
-            )
-            return True
-        except HttpResponseError:
-            # HTTP response received → DFS endpoint is alive → HNS enabled
-            return True
+            client_timeout = aiohttp.ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=client_timeout) as session:
+                async with session.get(dfs_url) as resp:
+                    server = resp.headers.get("Server", "")
+                    return "Windows-Azure-HDFS" in server or resp.status in (
+                        200,
+                        400,
+                        401,
+                        403,
+                    )
         except Exception:
             return False
 
@@ -607,20 +604,34 @@ class AzureBlobFileSystem(AsyncFileSystem):
         if not self.hns_enabled:
             return
         try:
-            from azure.storage.file.datalake.aio import (
+            from azure.storage.filedatalake.aio import (
                 DataLakeServiceClient as AIODataLakeServiceClient,
             )
 
-            self.datalake_service_client = AIODataLakeServiceClient(
-                account_url=self.account_url,
-                credential=self.credential or self.account_key or self.sas_token,
-            )
+            kwargs = {}
+            if self.credential is not None:
+                kwargs["credential"] = self.credential
+            elif self.account_key is not None:
+                kwargs["credential"] = self.account_key
+            elif self.sas_token is not None:
+                sas = (
+                    self.sas_token
+                    if self.sas_token.startswith("?")
+                    else f"?{self.sas_token}"
+                )
+                kwargs["account_url"] = self.account_url + sas
+
+            if "account_url" not in kwargs:
+                kwargs["account_url"] = self.account_url
+
+            client = AIODataLakeServiceClient(**kwargs)
+            self.datalake_service_client = client
             weakref.finalize(
                 self,
                 sync,
                 self.loop,
                 close_datalake_client,
-                self,
+                client,
             )
         except ImportError:
             pass
@@ -663,50 +674,36 @@ class AzureBlobFileSystem(AsyncFileSystem):
             # Priority 2: respect the endpoint type from URI host, if present
             url_ep = self.kwargs.pop("_url_endpoint_type", None)
             cloud_suffix = self.kwargs.pop("_url_cloud_suffix", "windows.net")
+            self._cloud_suffix = cloud_suffix
+            blob_url = f"https://{self.account_name}.blob.core.{cloud_suffix}"
+            dfs_url = f"https://{self.account_name}.dfs.core.{cloud_suffix}"
 
             if url_ep == "blob":
-                self.account_url = (
-                    f"https://{self.account_name}.blob.core.{cloud_suffix}"
-                )
-                self._connect_to(self.account_url)
+                self.account_url = blob_url
+                self._connect_to(blob_url)
                 self._hns_enabled = False
                 return
             elif url_ep == "dfs":
-                dfs_url = f"https://{self.account_name}.dfs.core.{cloud_suffix}"
-                blob_url = (
-                    f"https://{self.account_name}.blob.core.{cloud_suffix}"
-                )
-                self._connect_to(dfs_url)
-                hns = sync(self.loop, self._probe_hns)
-                if hns:
+                self._connect_to(blob_url)
+                if sync(self.loop, self._probe_hns, dfs_url):
                     self.account_url = dfs_url
-                    # Reconnect service_client to Blob endpoint —
-                    # Blob SDK operations (list_containers, etc.)
-                    # are not valid on the DFS endpoint.
-                    self._connect_to(blob_url)
                     self._hns_enabled = True
                     return
-                # DFS in URI but unreachable: fall back to Blob
-                self._connect_to(blob_url)
                 self.account_url = blob_url
                 self._hns_enabled = False
                 return
 
             # Priority 3: no host in URI, no account_host — DFS-first auto-detect
-            dfs_url = f"https://{self.account_name}.dfs.core.{cloud_suffix}"
-            blob_url = f"https://{self.account_name}.blob.core.{cloud_suffix}"
-            self._connect_to(dfs_url)
-            hns = sync(self.loop, self._probe_hns)
-            if hns:
+            self._connect_to(blob_url)
+            if self.account_name == "devstoreaccount1":
+                self.account_url = blob_url
+                self._hns_enabled = False
+                return
+
+            if sync(self.loop, self._probe_hns, dfs_url):
                 self.account_url = dfs_url
-                # Reconnect service_client to Blob endpoint —
-                # Blob SDK operations (list_containers, etc.)
-                # are not valid on the DFS endpoint.
-                self._connect_to(blob_url)
                 self._hns_enabled = True
                 return
-            # Fallback: reconnect to Blob endpoint
-            self._connect_to(blob_url)
             self.account_url = blob_url
             self._hns_enabled = False
 
@@ -1622,23 +1619,22 @@ class AzureBlobFileSystem(AsyncFileSystem):
         return await self._dir_exists(container_name, path)
 
     async def _dir_exists(self, container, path):
-        if self.hns_enabled:
-            # On HNS accounts, directories are real objects with
-            # is_directory=true metadata — use O(1) HEAD rather than
-            # an O(n) list_blobs prefix scan.
+        if self.hns_enabled and path:
             dir_path = path.rstrip("/")
             try:
                 async with self.service_client.get_blob_client(
                     container=container, blob=dir_path
                 ) as bc:
                     props = await bc.get_blob_properties()
-                    return (
-                        props.metadata.get("hdi_isfolder", "").lower() == "true"
-                        or props.metadata.get("is_directory") == "true"
-                    )
+                    meta = props.metadata or {}
+                    if (
+                        meta.get("hdi_isfolder", "").lower() == "true"
+                        or meta.get("is_directory") == "true"
+                    ):
+                        return True
             except ResourceNotFoundError:
-                return False
-        # Non-HNS: fall back to prefix-based listing
+                pass
+        # Non-HNS (or fallback for implicit directories without markers)
         dir_path = path.rstrip("/") + "/"
         try:
             async with self.service_client.get_container_client(
@@ -1948,10 +1944,15 @@ class AzureBlobFileSystem(AsyncFileSystem):
         container2, blob2, _ = self.split_path(path2, delimiter="/")
 
         # When called via copy(recursive=True), fsspec may include directory
-        # paths in the expanded list.  Directories are implicitly created
-        # when their contained files are copied — skip them here.
-        if await self._isdir(path1):
-            return
+        # paths in the expanded list. If a path is known in listings cache to be
+        # a directory on HNS accounts, skip it.
+        if self.hns_enabled and not version_id:
+            try:
+                entry = self._ls_from_cache(path1)
+                if entry and entry[0].get("type") == "directory":
+                    return
+            except (FileNotFoundError, KeyError):
+                pass
 
         cc1 = self.service_client.get_container_client(container1)
         blobclient1 = cc1.get_blob_client(blob=blob1)
@@ -1977,14 +1978,11 @@ class AzureBlobFileSystem(AsyncFileSystem):
     cp_file = sync_wrapper(_cp_file)
 
     async def _mv_file(self, path1, path2, **kwargs):
-        """Move file using DFS-native rename on HNS accounts, fall back
-        to server-side copy + delete.
-
-        On HNS accounts with azure-storage-file-datalake installed, uses
-        DataLakeFileClient.rename_file() — a server-side metadata operation.
-        Cross-container moves and non-HNS accounts fall back to
-        start_copy_from_url + delete_blob.
+        """Move file or directory using DFS-native rename on HNS accounts,
+        or fall back to server-side copy + delete.
         """
+        if path1 == path2:
+            return
         container1, blob1, _ = self.split_path(path1)
         container2, blob2, _ = self.split_path(path2)
 
@@ -1993,24 +1991,56 @@ class AzureBlobFileSystem(AsyncFileSystem):
             self.hns_enabled
             and container1 == container2
             and hasattr(self, "datalake_service_client")
+            and blob1
+            and blob2
         ):
             try:
-                fsc = self.datalake_service_client.get_file_system_client(
-                    container1
-                )
-                fc = fsc.get_file_client(blob1)
-                await fc.rename_file(new_name=blob2)
-                self.invalidate_cache()
+                fsc = self.datalake_service_client.get_file_system_client(container1)
+                new_name = f"{container1}/{blob2}"
+                if await self._isdir(path1):
+                    dc = fsc.get_directory_client(blob1)
+                    await dc.rename_directory(new_name=new_name)
+                else:
+                    fc = fsc.get_file_client(blob1)
+                    await fc.rename_file(new_name=new_name)
+                self.invalidate_cache(path1)
+                self.invalidate_cache(self._parent(path1))
+                self.invalidate_cache(path2)
+                self.invalidate_cache(self._parent(path2))
                 return
             except Exception:
                 # Fall through to copy+delete on any failure
                 pass
 
-        # Fallback: server-side copy + delete (current behavior)
+        # Fallback: server-side copy + delete
         await self._cp_file(path1, path2)
         await self._rm_file(path1)
 
     mv_file = sync_wrapper(_mv_file)
+
+    def mv(self, path1, path2, recursive=False, maxdepth=None, **kwargs):
+        """Move file(s) or directory from one location to another."""
+        if path1 == path2:
+            logger.debug("%s mv: The paths are the same, so no files were moved.", self)
+            return
+
+        container1, blob1, _ = self.split_path(path1)
+        container2, blob2, _ = self.split_path(path2)
+
+        if (
+            self.hns_enabled
+            and container1 == container2
+            and hasattr(self, "datalake_service_client")
+            and blob1
+            and blob2
+        ):
+            try:
+                sync(self.loop, self._mv_file, path1, path2, **kwargs)
+                return
+            except Exception:
+                pass
+
+        super().mv(path1, path2, recursive=recursive, maxdepth=maxdepth, **kwargs)
 
     def upload(self, lpath, rpath, recursive=False, **kwargs):
         """Alias of :ref:`FilesystemSpec.put`."""

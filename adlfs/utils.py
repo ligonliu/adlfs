@@ -102,10 +102,11 @@ async def close_credential(file_obj):
             credential.close()
 
 
-async def close_datalake_client(fs):
+async def close_datalake_client(client_or_fs):
     """
     Implements asynchronous closure of DataLake service client
     for AzureBlobFileSystem objects
     """
-    if hasattr(fs, "datalake_service_client"):
-        await fs.datalake_service_client.close()
+    client = getattr(client_or_fs, "datalake_service_client", client_or_fs)
+    if client is not None and hasattr(client, "close"):
+        await client.close()
