@@ -110,26 +110,29 @@ class TestEndpointSelection:
     def test_hns_detected_by_default(self, hns_fs):
         """Default auto-detect sets hns_enabled=True for Gen2 accounts."""
         assert hns_fs.hns_enabled is True
-        assert hns_fs.account_url.endswith(".dfs.core.windows.net")
+        # account_url remains the blob endpoint; DFS URL stored separately
+        assert ".blob.core." in hns_fs.account_url
+        assert hasattr(hns_fs, "_dfs_url")
 
     def test_blob_uri_skips_hns_probe(self, hns_fs_blob_uri):
-        """URI with blob.core.windows.net uses Blob endpoint, no probe."""
-        assert hns_fs_blob_uri.hns_enabled is False
+        """URI with blob.core.windows.net — HNS still detected via SDK."""
+        assert hns_fs_blob_uri.hns_enabled is True
         assert ".blob.core." in hns_fs_blob_uri.account_url
 
     def test_account_host_wins(self, hns_fs_account_host):
-        """account_host takes absolute precedence — no probing."""
-        assert hns_fs_account_host.hns_enabled is False
+        """account_host takes absolute precedence for endpoint URL."""
+        # HNS is still detected via SDK, even with custom account_host
+        assert hns_fs_account_host.hns_enabled is True
         assert ".dfs.core." in hns_fs_account_host.account_url
 
     def test_short_uri_defaults_to_dfs_first(self):
-        """Short URI (abfs://container/path) with account_name= probes DFS."""
+        """Short URI (abfs://container/path) with account_name= detects HNS via SDK."""
         _require_live_account()
         name, key, _, host = _config()
         fs = _make_fs(name, key, host)
         try:
             assert fs.hns_enabled is True
-            assert fs.account_url.endswith(".dfs.core.windows.net")
+            assert ".blob.core." in fs.account_url
         finally:
             pass  # no containers created, nothing to clean up
 
