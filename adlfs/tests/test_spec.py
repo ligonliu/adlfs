@@ -1413,6 +1413,101 @@ def test_metadata_write(storage):
     fs.rmdir("test-metadata-write")
 
 
+CONTENT_SETTINGS = {
+    "content_type": "application/pdf",
+    "content_disposition": 'attachment; filename="f.pdf"',
+    "cache_control": "max-age=3600",
+}
+
+
+def test_content_settings_open(storage):
+    fs = AzureBlobFileSystem(
+        account_name=storage.account_name, connection_string=CONN_STR
+    )
+    fs.mkdir("test-cs-open")
+    with fs.open("test-cs-open/file.pdf", "wb", content_settings=CONTENT_SETTINGS) as f:
+        f.write(b"0123456789")
+    cs = fs.info("test-cs-open/file.pdf")["content_settings"]
+    assert cs["content_type"] == "application/pdf"
+    assert cs["content_disposition"] == 'attachment; filename="f.pdf"'
+    assert cs["cache_control"] == "max-age=3600"
+
+    # empty streaming write still applies content settings
+    with fs.open(
+        "test-cs-open/empty.pdf", "wb", content_settings=CONTENT_SETTINGS
+    ) as f:
+        f.write(b"")
+    assert (
+        fs.info("test-cs-open/empty.pdf")["content_settings"]["content_type"]
+        == "application/pdf"
+    )
+    fs.rmdir("test-cs-open")
+
+
+def test_content_settings_append(storage):
+    fs = AzureBlobFileSystem(
+        account_name=storage.account_name, connection_string=CONN_STR
+    )
+    fs.mkdir("test-cs-append")
+    with fs.open(
+        "test-cs-append/file.pdf", "ab", content_settings=CONTENT_SETTINGS
+    ) as f:
+        f.write(b"0123456789")
+    cs = fs.info("test-cs-append/file.pdf")["content_settings"]
+    assert cs["content_type"] == "application/pdf"
+    assert cs["content_disposition"] == 'attachment; filename="f.pdf"'
+    fs.rmdir("test-cs-append")
+
+
+def test_content_settings_pipe_file(storage):
+    fs = AzureBlobFileSystem(
+        account_name=storage.account_name, connection_string=CONN_STR
+    )
+    fs.mkdir("test-cs-pipe")
+    fs.pipe_file(
+        "test-cs-pipe/piped.pdf", b"0123456789", content_settings=CONTENT_SETTINGS
+    )
+    info = fs.info("test-cs-pipe/piped.pdf")
+    assert info["content_settings"]["content_disposition"] == (
+        'attachment; filename="f.pdf"'
+    )
+    assert fs.cat_file("test-cs-pipe/piped.pdf") == b"0123456789"
+    fs.rmdir("test-cs-pipe")
+
+
+def test_content_settings_put_file(storage, tmp_path):
+    fs = AzureBlobFileSystem(
+        account_name=storage.account_name, connection_string=CONN_STR
+    )
+    fs.mkdir("test-cs-put")
+    local = tmp_path / "f.pdf"
+    local.write_bytes(b"0123456789")
+    fs.put_file(str(local), "test-cs-put/put.pdf", content_settings=CONTENT_SETTINGS)
+    info = fs.info("test-cs-put/put.pdf")
+    assert info["content_settings"]["content_type"] == "application/pdf"
+    assert fs.cat_file("test-cs-put/put.pdf") == b"0123456789"
+    fs.rmdir("test-cs-put")
+
+
+def test_content_settings_accepts_object(storage):
+    # A ContentSettings instance is accepted for compatibility (dict is the
+    # documented form).
+    from azure.storage.blob import ContentSettings
+
+    fs = AzureBlobFileSystem(
+        account_name=storage.account_name, connection_string=CONN_STR
+    )
+    fs.mkdir("test-cs-object")
+    settings = ContentSettings(content_type="application/pdf")
+    with fs.open("test-cs-object/obj.pdf", "wb", content_settings=settings) as f:
+        f.write(b"x")
+    assert (
+        fs.info("test-cs-object/obj.pdf")["content_settings"]["content_type"]
+        == "application/pdf"
+    )
+    fs.rmdir("test-cs-object")
+
+
 def test_put_file(storage, tmp_path):
     fs = AzureBlobFileSystem(
         account_name=storage.account_name, connection_string=CONN_STR
@@ -2012,6 +2107,7 @@ async def test_pipe_file_timeout(storage, mocker):
     upload_blob.assert_called_once_with(
         data=b"data",
         metadata={"is_directory": "false"},
+        content_settings=None,
         overwrite=True,
         max_concurrency=fs.max_concurrency,
         timeout=11,
@@ -2040,6 +2136,7 @@ async def test_put_file_timeout(storage, mocker, tmp_path):
     upload_blob.assert_called_once_with(
         mocker.ANY,
         metadata={"is_directory": "false"},
+        content_settings=None,
         overwrite=True,
         raw_response_hook=None,
         max_concurrency=fs.max_concurrency,
@@ -2610,3 +2707,59 @@ def test_etag_normalized_form(storage):
 )
 def test_striping_etag(input_etag, expected_etag):
     assert _normalize_etag_quotes(input_etag) == expected_etag
+
+
+def test_ls_files_with_same_prefix(storage):
+    fs = AzureBlobFileSystem(
+        account_name=storage.account_name,
+        connection_string=CONN_STR,
+    )
+    path1 = "data/test/file.txt"
+    path2 = "data/test/file.txt.1"
+    fs.touch(path1)
+    fs.touch(path2)
+
+    assert fs.ls("data/test/") == [path1, path2]
+    assert fs.ls("data/test/file.txt") == [path1]
+    assert fs.ls("data/test/file.txt.1") == [path2]
+
+    with pytest.raises(FileNotFoundError):
+        fs.ls("data/test/file.txt.")
+
+    fs.rm("data/test", recursive=True)
+
+
+async def test_filter_blobs_exact_file_versioned():
+    from adlfs.utils import filter_blobs
+
+    blobs = [
+        {
+            "name": "data/test/file.txt",
+            "type": "file",
+            "version_id": DEFAULT_VERSION_ID,
+            "is_current_version": None,
+        },
+        {
+            "name": "data/test/file.txt",
+            "type": "file",
+            "version_id": LATEST_VERSION_ID,
+            "is_current_version": True,
+        },
+        {
+            "name": "data/test/file.txt.1",
+            "type": "file",
+            "version_id": LATEST_VERSION_ID,
+            "is_current_version": True,
+        },
+    ]
+
+    result = await filter_blobs(blobs, "data/test/file.txt", version_id=None)
+    assert result == [blobs[1]]
+
+    result = await filter_blobs(
+        blobs, "data/test/file.txt", version_id=DEFAULT_VERSION_ID
+    )
+    assert result == [blobs[0]]
+
+    result = await filter_blobs(blobs, "data/test/file.txt", versions=True)
+    assert result == [blobs[0], blobs[1]]

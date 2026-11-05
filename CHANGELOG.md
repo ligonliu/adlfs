@@ -4,6 +4,11 @@ Unreleased
 ----------
 - .
 
+2026.8.0
+--------
+- Added a `content_settings` parameter to `open()` (write modes), `pipe_file()` and `put_file()` to set blob content settings (content type, content disposition, cache control, ...) on write. Accepts a `dict` (recommended) or an `azure.storage.blob.ContentSettings` instance. [#554](https://github.com/fsspec/adlfs/pull/554)
+- Fixed `ls()` returning incorrect results when a file shares the same prefix as other files in the same directory (fsspec/adlfs#409)
+
 2026.5.0
 --------
 - **Breaking:** Removed ADLS Gen1 support. The `adl://` protocol and AzureDatalakeFileSystem class are no longer available. It is recommended to use the `az://` protocol and/or `AzureBlobFileSystem`, which support Azure Blob Storage and Azure Data Lake Storage Gen2.
