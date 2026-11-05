@@ -88,7 +88,7 @@ _SOCKET_TIMEOUT_DEFAULT = object()
 _USER_AGENT = f"adlfs/{__version__}"
 
 _AZURE_SUFFIX_PATTERN = re.compile(
-    r"\.(?P<endpoint_type>dfs|blob)\.core\.(?P<suffix>[^/:]+)"
+    r"\.(?P<endpoint_type>dfs|blob)\.(?P<suffix>(?:core\.)?[^/:]+)"
 )
 
 
@@ -332,6 +332,12 @@ class AzureBlobFileSystem(AsyncFileSystem):
         self.dfs_probe_timeout = dfs_probe_timeout
         self.check_dfs = check_dfs
         self.kwargs = kwargs.copy()
+
+        if account_name and "://" in account_name:
+            url_kwargs = self._get_kwargs_from_urls(account_name)
+            self.kwargs.update(url_kwargs)
+            account_name = url_kwargs.get("account_name", None)
+
         super_kwargs = {
             k: kwargs.pop(k)
             for k in ["use_listings_cache", "listings_expiry_time", "max_paths"]
@@ -438,7 +444,6 @@ class AzureBlobFileSystem(AsyncFileSystem):
         if isinstance(path, list):
             return [cls._strip_protocol(p) for p in path]
 
-        STORE_SUFFIX = ".dfs.core.windows.net"
         logger.debug(f"_strip_protocol for {path}")
         if isinstance(cls.protocol, str):
             # The protocol can be either a string or a tuple of strings.
@@ -459,9 +464,8 @@ class AzureBlobFileSystem(AsyncFileSystem):
         # the format {host}/{path}
         # here host is the container_name
         elif ops.get("host", None):
-            if (
-                ops["host"].count(STORE_SUFFIX) == 0
-            ):  # no store-suffix, so this is container-name
+            if not _AZURE_SUFFIX_PATTERN.search(ops["host"]):
+                # Host is not an azure/onelake endpoint, so this is container-name
                 ops["path"] = ops["host"] + ops["path"]
         url_query = ops.get("url_query")
         if url_query is not None:
@@ -582,17 +586,18 @@ class AzureBlobFileSystem(AsyncFileSystem):
         """Detect whether the storage account has HNS enabled.
 
         Uses the SDK's ``get_account_information()`` which queries the
-        already-connected blob endpoint — no separate DFS connectivity
-        required.  Returns False on any error (e.g. insufficient
-        permissions, anonymous access).
+        already-connected blob endpoint. If permission is denied at the
+        account level (e.g. data-plane-only RBAC roles like Storage Blob
+        Data Contributor), falls back to checking DFS reachability.
         """
         try:
             info = await self.service_client.get_account_information()
             return bool(info.get("is_hns_enabled", False))
         except Exception:
-            logger.debug(
-                "Failed to detect HNS status; assuming disabled", exc_info=True
-            )
+            # Fall back to DFS probe when account-level permissions are restricted
+            if getattr(self, "_dfs_url", None):
+                timeout = getattr(self, "dfs_probe_timeout", 2.0)
+                return await self._check_dfs_reachability(self._dfs_url, timeout=timeout)
             return False
 
     async def _check_dfs_reachability(self, dfs_url: str, timeout: float = 2.0) -> bool:
@@ -727,13 +732,27 @@ class AzureBlobFileSystem(AsyncFileSystem):
                     "Must provide either a connection_string or account_name"
                 )
 
-            # Consume URL-derived kwargs; default cloud suffix to windows.net
+            # Consume URL-derived kwargs; default cloud suffix to core.windows.net
             url_ep = self.kwargs.pop("_url_endpoint_type", None)
-            cloud_suffix = self.kwargs.pop("_url_cloud_suffix", "windows.net")
+            cloud_suffix = self.kwargs.pop("_url_cloud_suffix", "core.windows.net")
+            if (
+                "." in cloud_suffix
+                and not cloud_suffix.startswith("core.")
+                and not cloud_suffix.startswith("fabric.")
+            ):
+                cloud_suffix = f"core.{cloud_suffix}"
             self._cloud_suffix = cloud_suffix
 
-            blob_url = f"https://{self.account_name}.blob.core.{cloud_suffix}"
-            self._dfs_url = f"https://{self.account_name}.dfs.core.{cloud_suffix}"
+            blob_url = f"https://{self.account_name}.blob.{cloud_suffix}"
+            self._dfs_url = f"https://{self.account_name}.dfs.{cloud_suffix}"
+
+            # If URL explicitly specifies a blob endpoint, go directly to blob only (skip DFS probe)
+            if url_ep == "blob":
+                self.account_url = blob_url
+                self._connect_to(blob_url)
+                self._hns_enabled = False
+                self._dfs_url = None
+                return
 
             # account_host overrides the endpoint URL entirely
             if hasattr(self, "account_host"):

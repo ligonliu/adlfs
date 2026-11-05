@@ -58,6 +58,12 @@ def _make_fs(account_name, account_key, account_host, **extra):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def spawn_azurite():
+    """HNS integration tests run against real ADLS Gen2; bypass Azurite container."""
+    yield None
+
+
 @pytest.fixture(scope="session")
 def hns_fs():
     """AzureBlobFileSystem connected via auto-detection (DFS-first with fallback)."""
@@ -67,7 +73,11 @@ def hns_fs():
     if container not in [c["name"] for c in fs.ls("", detail=True)]:
         fs.mkdir(container)
     yield fs
-    fs.rm(container, recursive=True)
+    try:
+        for item in fs.ls(container):
+            fs.rm(item, recursive=True)
+    except Exception:
+        pass
 
 
 @pytest.fixture
@@ -115,8 +125,8 @@ class TestEndpointSelection:
         assert hasattr(hns_fs, "_dfs_url")
 
     def test_blob_uri_skips_hns_probe(self, hns_fs_blob_uri):
-        """URI with blob.core.windows.net — HNS still detected via SDK."""
-        assert hns_fs_blob_uri.hns_enabled is True
+        """URI with blob.core.windows.net uses Blob endpoint directly, no probe."""
+        assert hns_fs_blob_uri.hns_enabled is False
         assert ".blob.core." in hns_fs_blob_uri.account_url
 
     def test_account_host_wins(self, hns_fs_account_host):

@@ -7,6 +7,12 @@ from azure.core.exceptions import HttpResponseError, ServiceRequestError
 from adlfs import AzureBlobFileSystem
 
 
+@pytest.fixture(autouse=True)
+def spawn_azurite():
+    """HNS unit tests do not require Azurite; bypass conftest.py fixture."""
+    yield None
+
+
 @pytest.mark.asyncio
 async def test_check_dfs_reachability_success():
     """Verify reachability returns True when server responds (even with HTTP error status)."""
@@ -148,3 +154,113 @@ async def test_mv_file_skips_dfs_when_client_is_none():
     # Directly executed copy + delete without touching DFS:
     fs._cp_file.assert_awaited_once()
     fs._rm_file.assert_awaited_once()
+
+
+def test_blob_url_skips_dfs_probe_and_disables_hns():
+    """URLs fitting a blob endpoint pattern skip probe and go directly to blob only."""
+    fs = MagicMock(spec=AzureBlobFileSystem)
+    fs.connection_string = None
+    fs.account_name = "myaccount"
+    fs.kwargs = {
+        "_url_endpoint_type": "blob",
+        "_url_cloud_suffix": "core.windows.net",
+    }
+    fs.account_key = "dummykey"
+    fs.credential = None
+    fs.sas_token = None
+    fs.loop = MagicMock()
+
+    AzureBlobFileSystem.do_connect(fs)
+
+    fs._connect_to.assert_called_once_with("https://myaccount.blob.core.windows.net")
+    fs._detect_hns.assert_not_called()
+    assert fs._hns_enabled is False
+    assert fs._dfs_url is None
+    assert fs.account_url == "https://myaccount.blob.core.windows.net"
+
+
+def test_onelake_and_sovereign_url_parsing():
+    """Verify URL parsing and protocol stripping across OneLake and Sovereign clouds."""
+    urls = [
+        # Commercial Azure
+        (
+            "abfss://container@myaccount.blob.core.windows.net/path/file.txt",
+            "container/path/file.txt",
+            {"account_name": "myaccount", "_url_endpoint_type": "blob", "_url_cloud_suffix": "core.windows.net"},
+        ),
+        (
+            "abfss://container@myaccount.dfs.core.windows.net/path/file.txt",
+            "container/path/file.txt",
+            {"account_name": "myaccount", "_url_endpoint_type": "dfs", "_url_cloud_suffix": "core.windows.net"},
+        ),
+        (
+            "abfs://myaccount.dfs.core.windows.net/container/path/file.txt",
+            "container/path/file.txt",
+            {"account_name": "myaccount", "_url_endpoint_type": "dfs", "_url_cloud_suffix": "core.windows.net"},
+        ),
+        # Sovereign: Azure China
+        (
+            "abfss://container@myaccount.blob.core.chinacloudapi.cn/path/file.txt",
+            "container/path/file.txt",
+            {"account_name": "myaccount", "_url_endpoint_type": "blob", "_url_cloud_suffix": "core.chinacloudapi.cn"},
+        ),
+        (
+            "abfs://myaccount.dfs.core.chinacloudapi.cn/container/path/file.txt",
+            "container/path/file.txt",
+            {"account_name": "myaccount", "_url_endpoint_type": "dfs", "_url_cloud_suffix": "core.chinacloudapi.cn"},
+        ),
+        # Sovereign: Azure US Gov
+        (
+            "abfss://container@myaccount.blob.core.usgovcloudapi.net/path/file.txt",
+            "container/path/file.txt",
+            {"account_name": "myaccount", "_url_endpoint_type": "blob", "_url_cloud_suffix": "core.usgovcloudapi.net"},
+        ),
+        # OneLake (Microsoft Fabric)
+        (
+            "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse/table",
+            "workspace/lakehouse/table",
+            {"account_name": "onelake", "_url_endpoint_type": "dfs", "_url_cloud_suffix": "fabric.microsoft.com"},
+        ),
+        (
+            "abfss://workspace@onelake.blob.fabric.microsoft.com/lakehouse/table",
+            "workspace/lakehouse/table",
+            {"account_name": "onelake", "_url_endpoint_type": "blob", "_url_cloud_suffix": "fabric.microsoft.com"},
+        ),
+        (
+            "abfs://onelake.dfs.fabric.microsoft.com/workspace/lakehouse/table",
+            "workspace/lakehouse/table",
+            {"account_name": "onelake", "_url_endpoint_type": "dfs", "_url_cloud_suffix": "fabric.microsoft.com"},
+        ),
+    ]
+
+    for url, expected_path, expected_kwargs in urls:
+        stripped = AzureBlobFileSystem._strip_protocol(url)
+        assert stripped == expected_path, f"Failed stripping on {url}: got {stripped}"
+
+        kwargs = AzureBlobFileSystem._get_kwargs_from_urls(url)
+        assert kwargs == expected_kwargs, f"Failed kwargs on {url}: got {kwargs}"
+
+
+def test_onelake_blob_bypasses_dfs_probe():
+    """OneLake blob URL goes directly to blob-only mode with 0 probe delay."""
+    fs = MagicMock(spec=AzureBlobFileSystem)
+    fs.connection_string = None
+    fs.account_name = "onelake"
+    fs.kwargs = {
+        "_url_endpoint_type": "blob",
+        "_url_cloud_suffix": "fabric.microsoft.com",
+    }
+    fs.account_key = None
+    fs.credential = MagicMock()
+    fs.sas_token = None
+    fs.loop = MagicMock()
+
+    AzureBlobFileSystem.do_connect(fs)
+
+    fs._connect_to.assert_called_once_with("https://onelake.blob.fabric.microsoft.com")
+    fs._detect_hns.assert_not_called()
+    assert fs._hns_enabled is False
+    assert fs._dfs_url is None
+    assert fs.account_url == "https://onelake.blob.fabric.microsoft.com"
+
+

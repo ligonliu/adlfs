@@ -40,51 +40,34 @@ def storage(host):
     bbs.insert_time = datetime.datetime.now(tz=datetime.timezone.utc).replace(
         microsecond=0
     )
-    container_client.upload_blob("top_file.txt", data, overwrite=True)
-    container_client.upload_blob("root/rfile.txt", data, overwrite=True)
-    container_client.upload_blob("root/a/file.txt", data, overwrite=True)
-    container_client.upload_blob("root/a1/file1.txt", data, overwrite=True)
-    container_client.upload_blob("root/b/file.txt", data, overwrite=True)
-    container_client.upload_blob("root/c/file1.txt", data, overwrite=True)
-    container_client.upload_blob("root/c/file2.txt", data, overwrite=True)
+    container_client.upload_blob("top_file.txt", data)
+    container_client.upload_blob("root/rfile.txt", data)
+    container_client.upload_blob("root/a/file.txt", data)
+    container_client.upload_blob("root/a1/file1.txt", data)
+    container_client.upload_blob("root/b/file.txt", data)
+    container_client.upload_blob("root/c/file1.txt", data)
+    container_client.upload_blob("root/c/file2.txt", data)
     container_client.upload_blob(
-        "root/d/file_with_metadata.txt", data, metadata=metadata, overwrite=True
+        "root/d/file_with_metadata.txt", data, metadata=metadata
     )
-    container_client.upload_blob("root/e+f/file1.txt", data, overwrite=True)
-    container_client.upload_blob("root/e+f/file2.txt", data, overwrite=True)
+    container_client.upload_blob("root/e+f/file1.txt", data)
+    container_client.upload_blob("root/e+f/file2.txt", data)
     yield bbs
 
-    try:
-        bbs.delete_container("data")
-    except Exception:
-        pass
+    bbs.delete_container("data")
 
 
 @pytest.fixture(scope="session", autouse=True)
-def spawn_azurite(host):
-    import socket
-
-    h, p = host.split(":")
-    try:
-        with socket.create_connection((h, int(p)), timeout=1):
-            yield None
-            return
-    except Exception:
-        pass
-
+def spawn_azurite():
     print("Starting azurite docker container")
-    try:
-        client = docker.from_env()
-        azurite = client.containers.run(
-            "mcr.microsoft.com/azure-storage/azurite",
-            "azurite-blob --loose --blobHost 0.0.0.0 --skipApiVersionCheck",
-            detach=True,
-            ports={"10000": "10000"},
-        )
-        print("Successfully created azurite container...")
-        yield azurite
-        print("Teardown azurite docker container")
-        azurite.stop()
-    except Exception as e:
-        print(f"Docker not available: {e}; skipping Azurite container startup")
-        yield None
+    client = docker.from_env()
+    azurite = client.containers.run(
+        "mcr.microsoft.com/azure-storage/azurite",
+        "azurite-blob --loose --blobHost 0.0.0.0 --skipApiVersionCheck",
+        detach=True,
+        ports={"10000": "10000"},
+    )
+    print("Successfully created azurite container...")
+    yield azurite
+    print("Teardown azurite docker container")
+    azurite.stop()
